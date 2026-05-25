@@ -505,3 +505,169 @@ async def calculate(req: CalculateRequest):
         zero_sum_check=round(delta_a + delta_b, 12),
         players=player_results,
     )
+
+
+def process_match(match_id: str):
+    """
+    Fetch everything needed for a match from Supabase, run the formula,
+    write results back. Called by both /webhook and /calculate.
+    """
+
+    # ── Idempotency guard ─────────────────────────────────────
+    match_row = (
+        supabase.table("matches")
+        .select("*")
+        .eq("match_id", match_id)
+        .single()
+        .execute()
+    )
+    if not match_row.data:
+        raise HTTPException(status_code=404, detail=f"Match {match_id} not found")
+
+    m = match_row.data
+
+    if m.get("rating_processed"):
+        log.warning(f"Match {match_id} already processed — skipping")
+        raise HTTPException(status_code=409, detail="Match already processed")
+
+    if not (m.get("confirmed_by_a") and m.get("confirmed_by_b")):
+        raise HTTPException(status_code=400, detail="Match not fully confirmed yet")
+
+    sport_id    = m["sport_id"]
+    game_format = m["game_format"]
+    match_type  = m["match_type"]
+    score_data  = m["score_data"]
+    race_target = m.get("race_target")
+    team_a_id   = m["team_a_id"]
+    team_b_id   = m["team_b_id"]
+
+    # ── Fetch sport params ────────────────────────────────────
+    sport_row = (
+        supabase.table("sports")
+        .select("k_value, max_pd, upset_divisor, elo_divisor, r0")
+        .eq("sport_id", sport_id)
+        .single()
+        .execute()
+    )
+    if not sport_row.data:
+        raise HTTPException(status_code=404, detail=f"Sport {sport_id} not found")
+
+    sp = sport_row.data
+    params = SportParams(
+        k_value=float(sp["k_value"]),
+        max_pd=float(sp["max_pd"]),
+        upset_divisor=float(sp["upset_divisor"]),
+        elo_divisor=float(sp["elo_divisor"]),
+        r0=float(sp["r0"]),
+    )
+
+    # ── Fetch participating players ───────────────────────────
+    mp_rows = (
+        supabase.table("match_players")
+        .select("player_id, team_id, rating_before")
+        .eq("match_id", match_id)
+        .execute()
+    )
+    if not mp_rows.data:
+        raise HTTPException(status_code=400, detail="No match_players rows found")
+
+    player_ids = [row["player_id"] for row in mp_rows.data]
+    ratings_rows = (
+        supabase.table("player_sport_ratings")
+        .select("player_id, current_rating")
+        .eq("sport_id", sport_id)
+        .in_("player_id", player_ids)
+        .execute()
+    )
+    ratings_map = {r["player_id"]: float(r["current_rating"]) for r in ratings_rows.data}
+
+    players_a, players_b = [], []
+    for row in mp_rows.data:
+        pid = row["player_id"]
+        rating = ratings_map.get(pid, float(params.r0))
+        ref = PlayerRef(player_id=pid, current_rating=rating)
+        if row["team_id"] == team_a_id:
+            players_a.append(ref)
+        else:
+            players_b.append(ref)
+
+    if not players_a or not players_b:
+        raise HTTPException(status_code=400, detail="Could not split players into two teams")
+
+    # ── Run formula ───────────────────────────────────────────
+    log.info(f"Processing match {match_id} | sport={sport_id} | format={game_format}")
+
+    try:
+        normalised_pd = normalise_score(
+            score_data=score_data,
+            game_format=game_format,
+            race_target=race_target,
+            max_pd=params.max_pd,
+        )
+    except (ValueError, KeyError, AssertionError) as e:
+        log.error(f"Score normalisation failed for match {match_id}: {e}")
+        raise HTTPException(status_code=422, detail=f"Score validation error: {e}")
+
+    ra = sum(p.current_rating for p in players_a) / len(players_a)
+    rb = sum(p.current_rating for p in players_b) / len(players_b)
+
+    delta_a, delta_b = calculate_deltas(
+        ra=ra, rb=rb,
+        normalised_pd=normalised_pd,
+        match_type=match_type,
+        params=params,
+    )
+
+    player_results: list[PlayerResult] = []
+    for p in players_a:
+        player_results.append(PlayerResult(
+            player_id=p.player_id, team="a",
+            rating_before=p.current_rating,
+            rating_after=round(p.current_rating + delta_a, 2),
+            rating_change=delta_a,
+        ))
+    for p in players_b:
+        player_results.append(PlayerResult(
+            player_id=p.player_id, team="b",
+            rating_before=p.current_rating,
+            rating_after=round(p.current_rating + delta_b, 2),
+            rating_change=delta_b,
+        ))
+
+    team_a_ids = {p.player_id for p in players_a}
+    write_rating_updates(match_id, sport_id, player_results, team_a_ids)
+
+    return CalculateResponse(
+        match_id=match_id,
+        team_a_rating=round(ra, 2),
+        team_b_rating=round(rb, 2),
+        normalised_pd=round(normalised_pd, 4),
+        delta_a=delta_a,
+        delta_b=delta_b,
+        zero_sum_check=round(delta_a + delta_b, 12),
+        players=player_results,
+    )
+
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    """
+    Receives Supabase database webhook payload.
+    Supabase sends: { type, table, schema, record, old_record }
+    We only care about record.match_id — we fetch everything else ourselves.
+    """
+    body = await request.json()
+    log.info(f"Webhook received: {body.get('type')} on {body.get('table')}")
+
+    record = body.get("record", {})
+    match_id = record.get("match_id")
+
+    if not match_id:
+        log.error(f"Webhook payload missing match_id: {body}")
+        raise HTTPException(status_code=400, detail="No match_id in webhook payload")
+
+    # Only process when both captains have confirmed
+    if not (record.get("confirmed_by_a") and record.get("confirmed_by_b")):
+        return {"status": "skipped", "reason": "not fully confirmed"}
+
+    return process_match(match_id)
